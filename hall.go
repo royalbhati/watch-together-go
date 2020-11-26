@@ -8,7 +8,6 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
-	"github.com/matryer/goblueprints/chapter1/trace"
 )
 
 const (
@@ -19,25 +18,17 @@ const (
 )
 
 type hall struct {
-
-	// forward is a channel that holds incoming messages
-	// that should be forwarded to the other clients.
-
 	socket *websocket.Conn
 
 	forward chan []byte
 
-	// join is a channel for clients wishing to join the room.
 	join chan *user
 
-	// leave is a channel for users wishing to leave the room.
 	leave chan *user
 
-	// clients holds all current clients in this room.
 	rooms map[uuid.UUID]*room
-	users map[uuid.UUID]*user
 
-	tracer trace.Tracer
+	users map[uuid.UUID]*user
 }
 
 // newRoom makes a new room that is ready to
@@ -49,7 +40,6 @@ func newHall() *hall {
 		leave:   make(chan *user),
 		rooms:   make(map[uuid.UUID]*room),
 		users:   make(map[uuid.UUID]*user),
-		tracer:  trace.Off(),
 	}
 }
 
@@ -57,13 +47,21 @@ func marshalData(userData map[string]interface{}) []byte {
 	val, err := json.Marshal(userData)
 
 	//What to do in the case of an error?
+	//Donnt want to exit because webserver
 	if err != nil {
-		return val
+		return nil
 	}
-	return nil
+	return val
 }
 func sendData(client *user, val []byte) {
 	client.send <- val
+}
+
+func sendToAll(users map[uuid.UUID]*user, val []byte) {
+	for _, v := range users {
+		v.send <- val
+	}
+
 }
 
 func (h *hall) runHall() {
@@ -72,7 +70,6 @@ func (h *hall) runHall() {
 		case client := <-h.join:
 			// joining
 			//handle errors make one function
-			h.tracer.Trace("New client joined")
 			h.users[client.id] = client
 			fmt.Printf("%+v\n", client)
 			userData := map[string]interface{}{
@@ -84,8 +81,6 @@ func (h *hall) runHall() {
 
 		case client := <-h.leave:
 
-			// leaving
-			// delete(h.clients, client)
 			payload := map[string]interface{}{
 				"type": "disconnect",
 				"id":   client.id,
@@ -93,12 +88,10 @@ func (h *hall) runHall() {
 			val := marshalData(payload)
 			h.forward <- val
 			close(client.send)
-			h.tracer.Trace("Client left")
 		case msg := <-h.forward:
-			h.tracer.Trace("Message received: ", string(msg))
 			var data socketData
 			json.Unmarshal([]byte(msg), &data)
-			fmt.Println("heyyyy", data.Type)
+			fmt.Println("event", string(msg))
 			switch data.Type {
 			case "create":
 				roomID := uuid.New()
@@ -114,32 +107,28 @@ func (h *hall) runHall() {
 					users:    usersinRoom,
 					roomSize: 2,
 				}
-
-				newData := make(map[string]interface{})
 				a := make([]string, 0)
 				for _, v := range usersinRoom {
 					a = append(a, v.name)
 
 				}
-				newData["type"] = NewRoom
-				newData["users"] = a
-				newData["roomID"] = roomID
-				newData["vId"] = data.VidID
-				newData["host"] = data.HostName
-				newData["name"] = data.HostName
+				payload := map[string]interface{}{
+					"type":   NewRoom,
+					"users":  a,
+					"roomID": roomID,
+					"vId":    data.VidID,
+					"host":   data.HostName,
+					"name":   data.HostName,
+				}
 
-				fmt.Println("------")
-				fmt.Printf("%+v\n", a)
-				fmt.Println("------")
-				val, _ := json.Marshal(newData)
-				host.send <- val
+				val := marshalData(payload)
+				sendData(host, val)
 			case "join":
 				joinee := h.users[data.JoineeID]
 				room := h.rooms[data.RoomID]
 				room.users[data.JoineeID] = joinee
 				(*joinee).name = data.UserName
 
-				newData := make(map[string]interface{})
 				a := make([]string, 0)
 				for _, v := range room.users {
 					if v.name != "" {
@@ -147,59 +136,56 @@ func (h *hall) runHall() {
 					}
 
 				}
+				payload := map[string]interface{}{
+					"type":   JoinRoom,
+					"users":  a,
+					"roomID": data.RoomID,
+					"vId":    room.vidID,
+					"host":   room.hostName,
+					"name":   data.UserName,
+				}
+				notifyPayload := map[string]interface{}{
+					"type":  "updateUsers",
+					"users": a,
+				}
 
-				//SEND A PING TOEACH USER TO UPDATE THEIR LIST
-				// joinee.send <- val
+				val := marshalData(payload)
+				notifyOthers := marshalData(notifyPayload)
+				sendData(joinee, val)
+				sendToAll(room.users, notifyOthers)
 
-				newData["type"] = JoinRoom
-				newData["users"] = a
-				newData["roomID"] = data.RoomID
-				newData["vId"] = room.vidID
-				newData["host"] = room.hostName
-				newData["name"] = data.UserName
-
-				fmt.Println("---JOIN---")
-				fmt.Printf("%+v\n", a)
-				fmt.Println("------")
-				val, _ := json.Marshal(newData)
-				joinee.send <- val
 			case "vid":
 				room := h.rooms[data.RoomID]
-				newData := make(map[string]interface{})
-				newData["type"] = "vidChange"
-				newData["status"] = data.Status
-				newData["roomID"] = data.RoomID
-
-				//hack to see if empty value
-				newData["time"] = data.Time
-
-				val, _ := json.Marshal(newData)
-
-				//handle closed channels
-				// by removing guys once connection closed
-				for _, v := range room.users {
-					// if v.id != data.JoineeID {
-					v.send <- val
-					// }
+				payload := map[string]interface{}{
+					"type":   "vidChange",
+					"status": data.Status,
+					"roomID": data.RoomID,
+					"time":   data.Time,
 				}
+				val := marshalData(payload)
+				sendToAll(room.users, val)
 
 			case "message":
 				room := h.rooms[data.RoomID]
 				sender := room.users[data.JoineeID]
-				newData := make(map[string]interface{})
-				newData["type"] = "newMessage"
-				newData["text"] = data.Text
-				newData["sender"] = sender.name
-
-				val, _ := json.Marshal(newData)
-
-				//handle closed channels
-				// by removing guys once connection closed
-				for _, v := range room.users {
-					// if v.id != data.JoineeID {
-					v.send <- val
-					// }
+				payload := map[string]interface{}{
+					"type":   "newMessage",
+					"text":   data.Text,
+					"sender": sender.name,
 				}
+				val := marshalData(payload)
+				sendToAll(room.users, val)
+
+			case "changeVideo":
+				room := h.rooms[data.RoomID]
+				room.vidID = data.VidID
+				payload := map[string]interface{}{
+					"type": "newVideo",
+					"vId":  data.VidID,
+				}
+				val := marshalData(payload)
+				sendToAll(room.users, val)
+
 			case "disconnect":
 				room := h.rooms[data.RoomID]
 
@@ -213,19 +199,17 @@ func (h *hall) runHall() {
 					a = append(a, v.name)
 
 				}
-				newData := make(map[string]interface{})
-				newData["type"] = "userLeft"
-				newData["id"] = user.name
-				newData["users"] = a
-				val, _ := json.Marshal(newData)
-				for _, v := range room.users {
-					v.send <- val
+				payload := map[string]interface{}{
+					"type":  "userLeft",
+					"id":    user.name,
+					"users": a,
 				}
-			default:
-				fmt.Println("Can I get a ohhh yeahhhh!")
-			}
-			h.tracer.Trace(" -- sent to client")
 
+				val := marshalData(payload)
+				sendToAll(room.users, val)
+			default:
+				fmt.Println("Unsupported Type")
+			}
 		}
 	}
 }
